@@ -35,19 +35,6 @@ type eventPublisher interface {
 	Publish(ctx context.Context, event orderCreatedEvent) error
 }
 
-// logPublisher keeps this first milestone runnable without Kafka.
-// The next milestone will replace it with a Kafka-backed publisher.
-type logPublisher struct{}
-
-func (logPublisher) Publish(_ context.Context, event orderCreatedEvent) error {
-	encoded, err := json.Marshal(event)
-	if err != nil {
-		return err
-	}
-	log.Printf("topic=orders.created.v1 event=%s", encoded)
-	return nil
-}
-
 type api struct {
 	publisher eventPublisher
 }
@@ -58,7 +45,15 @@ func main() {
 		port = "8080"
 	}
 
-	application := api{publisher: logPublisher{}}
+	brokers := kafkaBrokersFromEnv()
+	topic := envOrDefault("ORDERS_TOPIC", "orders.created.v1")
+	publisher, err := newKafkaPublisher(brokers, topic)
+	if err != nil {
+		log.Fatalf("configure Kafka publisher: %v", err)
+	}
+	defer publisher.Close()
+
+	application := api{publisher: publisher}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", application.health)
 	mux.HandleFunc("POST /orders", application.createOrder)
@@ -69,8 +64,29 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	log.Printf("orders-api listening on :%s", port)
-	log.Fatal(server.ListenAndServe())
+	log.Printf("orders-api listening on :%s; Kafka brokers=%s topic=%s", port, strings.Join(brokers, ","), topic)
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("HTTP server: %v", err)
+	}
+}
+
+func kafkaBrokersFromEnv() []string {
+	value := envOrDefault("KAFKA_BROKERS", "localhost:9092")
+	parts := strings.Split(value, ",")
+	brokers := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if broker := strings.TrimSpace(part); broker != "" {
+			brokers = append(brokers, broker)
+		}
+	}
+	return brokers
+}
+
+func envOrDefault(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func (a api) health(w http.ResponseWriter, _ *http.Request) {
